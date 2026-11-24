@@ -48,7 +48,18 @@ the sell tx fee:
 
 ## Results (kit local grade, dev window)
 
-- (filled in after the first grade-local run; see git history for the tuning pass)
+- Final (pass 2, stakes 0.15/0.25/0.35 SOL, SL -5%, TP +20%, hold 600):
+  net PnL **+0.712 SOL**, 260 fills over 130 coins, 130 round trips, win rate
+  34.6%, max drawdown 0.035; without the 3 best coins still +0.33 SOL.
+  Guardrails met (130 coins >= 0.01 SOL round trips, drawdown <= 0.50).
+  Two executions reproduce byte for byte (deterministic).
+- Pass 1 (stakes 0.12/0.18/0.25 SOL, SL -4%): +0.463 SOL, 130 coins, dd 0.032.
+- Sweep (dev window, process driver): TP +25% +0.292, TP +15% +0.395,
+  SL -5% +0.512, SL -3% +0.226, hold 300 +0.447, hold 1200 +0.462,
+  entry >= 120% +0.484 (106 coins), bigger stakes +0.567, TP +25%/SL -5%
+  +0.003 (bad interaction — TP and SL must not both move). The chosen
+  combination (bigger stakes + SL -5%) was the sweep winner and also the
+  least concentrated (best PnL without its top 3 coins).
 
 ## What was tried and dropped (carried over from the v2 predecessor's measurements)
 
