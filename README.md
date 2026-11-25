@@ -10,8 +10,8 @@ A Solana paper-trading bot for the [Pump.fun Bot Sprint: Make Bot And Win](https
 
 Slot-0 spike rider: the bot only buys on a coin's create batch, when the slot-0
 tape shows a price run-up of >= 100% over the create price, the creator has not
-sold, and real SOL is >= 0.5. It sizes up with the run-up (0.12 / 0.18 / 0.25 SOL),
-takes profit at +20%, cuts losers at -4%, never holds past 600 slots, and exits at
+sold, and real SOL is >= 0.5. It sizes up with the run-up (0.15 / 0.25 / 0.35 SOL),
+takes profit at +20%, cuts losers at -5%, never holds past 600 slots, and exits at
 once when the creator sells. A minimum-size filler tier (0.01 SOL) buys 80-100%
 run-ups as insurance for the 20-coin guardrail bar in the short 6h final window.
 

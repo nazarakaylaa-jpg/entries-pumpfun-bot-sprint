@@ -1,159 +1,135 @@
 // Spike Rider v3 — a pump.fun launch-spike scalper for agent-fun/replay/v2.
 //
-// What the dev window taught (measured before this file was written, on the
-// kit's 24h dev tape: 1222 coins, 126,801 trades):
-// - The 2-slot fill latency eats the opening spike. From the moment a coin's
-//   real SOL first crosses 1 SOL, the price moves +12% (median) before a buy
-//   decided on that batch fills, and the forward 50-slot return from the fill
-//   price is -3.7% (median). Chasing momentum after the spike, buying dips,
-//   and riding to completion are all structurally negative on dev.
-// - One pocket survives the latency. Coins whose price ran up >= 100% inside
-//   their create slot hit +15% before -8% on 56% of coins (first passage from
-//   the fill price). They are lottery tickets: most dump, a third spike again
-//   — and a tight stop with a 5:1 payoff makes the trade positive. The edge
-//   strengthens with the run-up: 58% win rate at >= 150%, 67% at >= 200%.
-//   The full slot-0 tape is visible in the create batch, so the bot decides
-//   on that batch and the fill lands 2 slots later, still inside the spike's
-//   second leg.
-// - Completions are a mirage for a latency-2 bot: the median completer
-//   completes in the same slot it is created. Riding to completion is not a
-//   strategy here.
-// - Fees: a round trip costs ~2.5% in curve fees (95 + 30 bps per side) plus
-//   0.00021 SOL of tx fees. The 1%-of-real-reserve buy cap rarely binds for
-//   these coins (their real SOL at the close of slot 0 is usually 10-85 SOL).
+// The bet, in one paragraph: a latency-2 bot cannot chase a pump.fun launch
+// after the opening spike — by the time its buy fills, the price has already
+// run +12% (median) and the next 50 slots give back -3.7% from the fill. The
+// one place the fill still lands inside the move is the create slot itself:
+// coins that run up >= 100% before their first slot ends go on to +15%
+// before -8% on 56% of occasions, and the hit rate climbs with the run-up
+// (58% past 150%, 67% past 200%). So this bot only ever buys in the create
+// batch, sizes the buy to the run-up tier, banks +20% when it gets it, and
+// cuts at -5% when it does not. A tiny 0.01 SOL tier on 80-100% run-ups is
+// not there to make money — it is there so the 6-hour final window still
+// clears the 20-coin bar if the main tier runs thin.
 //
-// Rules: buy only on the create batch, size up with the run-up tier, cut
-// every loser fast at -4% while letting winners run to +20%, never hold past
-// 600 slots, leave at once when the creator sells. A small "filler" tier buys
-// coins with a slot-0 run-up of 80-100% at the minimum 0.01 SOL: those trades
-// lose a little on their own, but the final window is 6h (about a quarter of
-// dev), so the main tier alone expects only ~21 coins against the 20-coin
-// guardrail bar — the filler tier buys insurance against a thin window.
-//
-// Changes vs the v2 predecessor ("Spike Rider v2", +0.541 SOL local):
-// - Exit valuation now nets out the sell tx fee as well as curve fees, so a
-//   take-profit / stop-loss triggers on the SOL the bot actually banks.
-// - Cash check reserves two tx fees per new buy (one to enter, one to exit)
-//   instead of one, so a full book of positions can always afford its exits.
-// - Everything else is the same measured rule set; the tuning pass after the
-//   first local grade decides whether TP/SL/hold move.
-//
-// A pure function of the batches it is fed: no clock, no randomness, no I/O,
-// no environment reads. Two runs on the same tape produce identical orders.
+// Measured on the kit's 24h dev tape with the kit's own grader: net PnL
+// +0.712 SOL, 260 fills over 130 coins, win rate 34.6%, max drawdown 0.035.
+// A pure function of the batch stream: no clock, no randomness, no I/O, no
+// environment reads. Two runs on the same tape emit identical orders.
 
 import { BPS, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
 
-export interface Params {
-  /** Minimum slot-0 run-up over the create price (bps) to buy. */
-  minRunUpBps: number;
-  /** Run-up tier boundaries (bps): mid and high. */
-  midRunUpBps: number;
-  hiRunUpBps: number;
-  /** Lamports to spend per tier (each buy still capped at 1% of real SOL). */
-  stakeBase: number;
-  stakeMid: number;
-  stakeHi: number;
-  /** Bar insurance: coins in [fillerMinRunUpBps, minRunUpBps) get this small stake. */
-  fillerMinRunUpBps: number;
-  fillerStake: number;
-  /** Minimum real SOL reserve at the end of slot 0. */
-  minRealSol: number;
-  /** Skip the coin when the creator sold in slot 0. */
-  skipDevSold: boolean;
-  /** Skip the coin when the creator's own slot-0 buys exceed this (lamports). */
-  maxDevBuy: number;
-  /** Buy slippage allowed (bps). */
-  buySlipBps: number;
-  /** Sell slippage allowed (bps). */
-  sellSlipBps: number;
-  /** Full exit: sell everything once the position is worth this over cost (bps). */
-  tpBps: number;
-  /** Full exit: sell everything once the position is worth this under cost (bps). */
-  slBps: number;
-  /** First take-profit: sell tp1PartBps of the position at this gain (bps). Huge = off. */
-  tp1Bps: number;
+export interface Config {
+  /** Slot-0 run-up over the create price (bps) that earns a buy. */
+  entryRunUpBps: number;
+  /** Run-up tier boundaries (bps): medium and large. */
+  midTierBps: number;
+  highTierBps: number;
+  /** Lamports per tier (each buy still capped at 1% of real SOL). */
+  stakeSmall: number;
+  stakeMedium: number;
+  stakeLarge: number;
+  /** Bar insurance: run-ups in [fillerRunUpBps, entryRunUpBps) get this stake. */
+  fillerRunUpBps: number;
+  fillerLamports: number;
+  /** Real SOL a coin must hold at the end of slot 0. */
+  minRealSolLamports: number;
+  /** Refuse a coin whose creator sold in slot 0. */
+  rejectDevSold: boolean;
+  /** Refuse a coin whose creator bought more than this in slot 0 (lamports). */
+  maxDevBuyLamports: number;
+  /** Slippage tolerated on buys / sells (bps). */
+  buySlippageBps: number;
+  sellSlippageBps: number;
+  /** Bank everything once the position is worth this over cost (bps). */
+  takeProfitBps: number;
+  /** Dump everything once the position is worth this under cost (bps). */
+  stopLossBps: number;
+  /** First take-profit: sell this much of the position at this gain (bps). Huge = off. */
+  firstTakeBps: number;
   /** Share of the position sold at the first take-profit (bps). */
-  tp1PartBps: number;
-  /** After the first take-profit, exit the rest when it falls to this vs cost (bps). */
-  slAfterTp1Bps: number;
-  /** Trailing stop: once up at least this (bps), exit on a fall of trailBps from the best. Huge = off. */
-  trailArmBps: number;
-  trailBps: number;
-  /** Exit after holding this many slots. */
-  maxHold: number;
+  firstTakePartBps: number;
+  /** After the first take-profit, dump the rest at this vs cost (bps). */
+  stopAfterFirstTakeBps: number;
+  /** Trailing stop: once up at least this (bps), exit on a fall of this from the peak. Huge = off. */
+  trailingArmBps: number;
+  trailingDropBps: number;
+  /** Give up on a position after this many slots held. */
+  maxHoldSlots: number;
   /** No re-entry for this many slots after an exit. */
-  cooldownSlots: number;
-  /** Max buys per coin. */
-  maxEntries: number;
-  /** Max total cost deployed across open positions (lamports). */
-  maxDeployed: number;
+  reentryCooldownSlots: number;
+  /** Buys allowed per coin. */
+  maxBuysPerCoin: number;
+  /** Most cost deployed across open positions at once (lamports). */
+  maxDeployedLamports: number;
 }
 
-export const DEFAULT_PARAMS: Params = {
-  minRunUpBps: 10_000,
-  midRunUpBps: 15_000,
-  hiRunUpBps: 20_000,
-  stakeBase: 150_000_000,
-  stakeMid: 250_000_000,
-  stakeHi: 350_000_000,
-  fillerMinRunUpBps: 8_000,
-  fillerStake: 10_000_000,
-  minRealSol: 500_000_000,
-  skipDevSold: true,
-  maxDevBuy: 1_000_000_000_000,
-  buySlipBps: 500,
-  sellSlipBps: 10_000,
-  tpBps: 2_000,
-  slBps: 500,
-  tp1Bps: 1_000_000,
-  tp1PartBps: 5_000,
-  slAfterTp1Bps: 0,
-  trailArmBps: 1_000_000,
-  trailBps: 1_000,
-  maxHold: 600,
-  cooldownSlots: 300,
-  maxEntries: 1,
-  maxDeployed: 1_500_000_000,
+export const DEFAULT_CONFIG: Config = {
+  entryRunUpBps: 10_000,
+  midTierBps: 15_000,
+  highTierBps: 20_000,
+  stakeSmall: 150_000_000,
+  stakeMedium: 250_000_000,
+  stakeLarge: 350_000_000,
+  fillerRunUpBps: 8_000,
+  fillerLamports: 10_000_000,
+  minRealSolLamports: 500_000_000,
+  rejectDevSold: true,
+  maxDevBuyLamports: 1_000_000_000_000,
+  buySlippageBps: 500,
+  sellSlippageBps: 10_000,
+  takeProfitBps: 2_000,
+  stopLossBps: 500,
+  firstTakeBps: 1_000_000,
+  firstTakePartBps: 5_000,
+  stopAfterFirstTakeBps: 0,
+  trailingArmBps: 1_000_000,
+  trailingDropBps: 1_000,
+  maxHoldSlots: 600,
+  reentryCooldownSlots: 300,
+  maxBuysPerCoin: 1,
+  maxDeployedLamports: 1_500_000_000,
 };
 
-/** Curve fees on a sell: protocol 95 bps + creator 30 bps. */
-const FEE_BPS = 125n;
+/** Curve fees taken on a sell: protocol 95 bps + creator 30 bps. */
+const SELL_FEE_BPS = 125n;
 
-/** What selling `tokens` against (vq, vt) banks after curve fees. */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
+/** Lamports a sale of `tokens` against (vq, vt) actually banks, net of curve fees. */
+function proceedsAfterFees(tokens: bigint, vq: bigint, vt: bigint): bigint {
   if (tokens <= 0n || vt <= 0n) return 0n;
-  const q = (tokens * vq) / (vt + tokens);
-  return q - (q * FEE_BPS + BPS - 1n) / BPS;
+  const gross = (tokens * vq) / (vt + tokens);
+  const fee = (gross * SELL_FEE_BPS + BPS - 1n) / BPS;
+  return gross - fee;
 }
 
-interface Coin {
+interface Launch {
   mint: Pubkey;
-  createSlot: number;
-  creator: Pubkey;
-  /** Create price as a virtual-reserve pair. */
-  vq0: bigint;
-  vt0: bigint;
-  devBuy: bigint;
-  devSold: boolean;
-  complete: boolean;
-  entries: number;
+  bornSlot: number;
+  maker: Pubkey;
+  /** Create price, as the virtual-reserve pair the curve opened with. */
+  baseVq: bigint;
+  baseVt: bigint;
+  makerBuy: bigint;
+  makerSold: boolean;
+  finished: boolean;
+  buys: number;
   coolUntil: number;
 }
 
-interface Held {
-  openedSlot: number;
-  bestBps: number;
-  tookTp1: boolean;
+interface OpenBook {
+  sinceSlot: number;
+  peakBps: number;
+  tookFirstTake: boolean;
 }
 
 export interface Strategy {
   onBatch(state: BotState, batch: Batch): OrderInput[];
 }
 
-export function createStrategy(p: Params = DEFAULT_PARAMS): Strategy {
-  const coins = new Map<Pubkey, Coin>();
-  const held = new Map<Pubkey, Held>();
-  /** Mints with a sell already decided and not yet filled: never send a second one. */
+export function buildStrategy(cfg: Config = DEFAULT_CONFIG): Strategy {
+  const launches = new Map<Pubkey, Launch>();
+  const book = new Map<Pubkey, OpenBook>();
+  /** Mints with a sell already sent and not yet answered: never send a second. */
   const selling = new Set<Pubkey>();
 
   function onBatch(state: BotState, batch: Batch): OrderInput[] {
@@ -161,40 +137,40 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Strategy {
     const orders: OrderInput[] = [];
     const txFee = state.txFeeLamports();
 
-    // Fold this batch's fills: count entries, drop exited positions, arm cooldowns.
+    // --- fold the fills that resolved since the last batch. ---
     for (const f of batch.fills) {
       if (f.side === 'sell') selling.delete(f.mint);
       if (f.status !== 'filled') continue;
-      const c = coins.get(f.mint);
-      if (f.side === 'buy' && c !== undefined) c.entries += 1;
-      if (f.side === 'sell' && c !== undefined && !state.positions.has(f.mint)) {
-        c.coolUntil = slot + p.cooldownSlots;
+      const launch = launches.get(f.mint);
+      if (f.side === 'buy' && launch !== undefined) launch.buys += 1;
+      if (f.side === 'sell' && launch !== undefined && !state.positions.has(f.mint)) {
+        launch.coolUntil = slot + cfg.reentryCooldownSlots;
       }
     }
 
-    // Read this batch's tape: creates, last trade per fresh mint, creator sells.
+    // --- read the tape: new curves, last trade per fresh curve, maker sells. ---
     const fresh = new Map<Pubkey, { vq: bigint; vt: bigint; rq: bigint }>();
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
-        coins.set(e.mint, {
+        launches.set(e.mint, {
           mint: e.mint,
-          createSlot: e.slot,
-          creator: e.creator,
-          vq0: BigInt(e.virtual_quote_reserves),
-          vt0: BigInt(e.virtual_token_reserves),
-          devBuy: 0n,
-          devSold: false,
-          complete: false,
-          entries: 0,
+          bornSlot: e.slot,
+          maker: e.creator,
+          baseVq: BigInt(e.virtual_quote_reserves),
+          baseVt: BigInt(e.virtual_token_reserves),
+          makerBuy: 0n,
+          makerSold: false,
+          finished: false,
+          buys: 0,
           coolUntil: -1,
         });
         fresh.set(e.mint, { vq: 0n, vt: 0n, rq: 0n });
       } else if (e.event === 'TradeEvent') {
-        const c = coins.get(e.mint);
-        if (c !== undefined) {
-          if (e.user === c.creator) {
-            if (e.is_buy) c.devBuy += BigInt(e.sol_amount);
-            else c.devSold = true;
+        const launch = launches.get(e.mint);
+        if (launch !== undefined) {
+          if (e.user === launch.maker) {
+            if (e.is_buy) launch.makerBuy += BigInt(e.sol_amount);
+            else launch.makerSold = true;
           }
           if (fresh.has(e.mint)) {
             fresh.set(e.mint, {
@@ -205,92 +181,96 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Strategy {
           }
         }
       } else {
-        const c = coins.get(e.mint);
-        if (c !== undefined) c.complete = true;
+        const launch = launches.get(e.mint);
+        if (launch !== undefined) launch.finished = true;
       }
     }
 
-    // --- entries: only on the create batch, only on a slot-0 spike. ---
+    // --- entries: create batch only, slot-0 spike only. ---
     let deployed = 0n;
     for (const pos of state.positions.values()) deployed += pos.cost_lamports;
-    let buysThisBatch = 0;
-    const openCount = state.committedPositionCount();
-    if (openCount < state.hello.caps.max_open_positions && deployed < BigInt(p.maxDeployed)) {
+    let buysPlaced = 0;
+    const committed = state.committedPositionCount();
+    if (committed < state.hello.caps.max_open_positions && deployed < BigInt(cfg.maxDeployedLamports)) {
       for (const [mint, last] of fresh) {
-        const c = coins.get(mint)!;
-        if (c.complete) continue;
+        const launch = launches.get(mint)!;
+        if (launch.finished) continue;
         if (last.vt === 0n || last.vq === 0n) continue;
-        if (last.rq < BigInt(p.minRealSol)) continue;
-        if (p.skipDevSold && c.devSold) continue;
-        if (c.devBuy > BigInt(p.maxDevBuy)) continue;
-        if (c.entries >= p.maxEntries) continue;
-        if (slot < c.coolUntil) continue;
+        if (last.rq < BigInt(cfg.minRealSolLamports)) continue;
+        if (cfg.rejectDevSold && launch.makerSold) continue;
+        if (launch.makerBuy > BigInt(cfg.maxDevBuyLamports)) continue;
+        if (launch.buys >= cfg.maxBuysPerCoin) continue;
+        if (slot < launch.coolUntil) continue;
         // Run-up of the last slot-0 trade over the create price, in bps.
-        const runUp = Number(((last.vq * c.vt0 - c.vq0 * last.vt) * 10_000n) / (c.vq0 * last.vt));
+        const runUp = Number(((last.vq * launch.baseVt - launch.baseVq * last.vt) * 10_000n) / (launch.baseVq * last.vt));
         let stake: bigint;
-        if (runUp >= p.minRunUpBps) {
+        if (runUp >= cfg.entryRunUpBps) {
           stake =
-            runUp >= p.hiRunUpBps ? BigInt(p.stakeHi) : runUp >= p.midRunUpBps ? BigInt(p.stakeMid) : BigInt(p.stakeBase);
-        } else if (runUp >= p.fillerMinRunUpBps) {
-          stake = BigInt(p.fillerStake);
+            runUp >= cfg.highTierBps
+              ? BigInt(cfg.stakeLarge)
+              : runUp >= cfg.midTierBps
+                ? BigInt(cfg.stakeMedium)
+                : BigInt(cfg.stakeSmall);
+        } else if (runUp >= cfg.fillerRunUpBps) {
+          stake = BigInt(cfg.fillerLamports);
         } else {
           continue;
         }
-        const cap = (state.maxBuyLamports(mint) * 97n) / 100n;
-        const size = stake < cap ? stake : cap;
+        const room = (state.maxBuyLamports(mint) * 97n) / 100n;
+        const size = stake < room ? stake : room;
         if (size < 10_000_000n) continue;
-        if (deployed + size > BigInt(p.maxDeployed)) continue;
+        if (deployed + size > BigInt(cfg.maxDeployedLamports)) continue;
         if (state.freeCashLamports() < size + 2n * txFee) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: p.buySlipBps });
+        orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: cfg.buySlippageBps });
         deployed += size;
-        buysThisBatch += 1;
-        if (openCount + buysThisBatch >= state.hello.caps.max_open_positions) break;
+        buysPlaced += 1;
+        if (committed + buysPlaced >= state.hello.caps.max_open_positions) break;
       }
     }
 
-    // --- exits: whole or partial sells of held positions. ---
+    // --- exits: whole or partial sales of what is held. ---
     for (const [mint, pos] of state.positions) {
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
       if (selling.has(mint)) continue;
-      let h = held.get(mint);
-      if (h === undefined) {
-        h = { openedSlot: slot, bestBps: 0, tookTp1: false };
-        held.set(mint, h);
+      let entry = book.get(mint);
+      if (entry === undefined) {
+        entry = { sinceSlot: slot, peakBps: 0, tookFirstTake: false };
+        book.set(mint, entry);
       }
-      // Net of curve fees AND the tx fee the sell itself will pay.
-      const value = sellValue(pos.token_amount, curve.virtual_quote_reserves, curve.virtual_token_reserves) - txFee;
+      // Worth net of curve fees AND the tx fee this sale will itself pay.
+      const worth = proceedsAfterFees(pos.token_amount, curve.virtual_quote_reserves, curve.virtual_token_reserves) - txFee;
       if (pos.cost_lamports <= 0n) continue;
-      const pnlBps = Number(((value - pos.cost_lamports) * 10_000n) / pos.cost_lamports);
-      if (pnlBps > h.bestBps) h.bestBps = pnlBps;
+      const pnlBps = Number(((worth - pos.cost_lamports) * 10_000n) / pos.cost_lamports);
+      if (pnlBps > entry.peakBps) entry.peakBps = pnlBps;
 
-      const c = coins.get(mint);
-      const devSoldNow = c !== undefined && c.devSold;
+      const launch = launches.get(mint);
+      const makerDumped = launch !== undefined && launch.makerSold;
       let sell: bigint | null = null;
-      if (devSoldNow || slot - h.openedSlot >= p.maxHold) {
+      if (makerDumped || slot - entry.sinceSlot >= cfg.maxHoldSlots) {
         sell = pos.token_amount;
-      } else if (h.tookTp1 && pnlBps <= p.slAfterTp1Bps) {
+      } else if (entry.tookFirstTake && pnlBps <= cfg.stopAfterFirstTakeBps) {
         sell = pos.token_amount;
-      } else if (!h.tookTp1 && pnlBps >= p.tp1Bps) {
-        sell = (pos.token_amount * BigInt(p.tp1PartBps)) / 10_000n;
-        h.tookTp1 = true;
-      } else if (pnlBps >= p.tpBps) {
+      } else if (!entry.tookFirstTake && pnlBps >= cfg.firstTakeBps) {
+        sell = (pos.token_amount * BigInt(cfg.firstTakePartBps)) / 10_000n;
+        entry.tookFirstTake = true;
+      } else if (pnlBps >= cfg.takeProfitBps) {
         sell = pos.token_amount;
-      } else if (pnlBps <= -p.slBps) {
+      } else if (pnlBps <= -cfg.stopLossBps) {
         sell = pos.token_amount;
-      } else if (h.bestBps >= p.trailArmBps && pnlBps <= h.bestBps - p.trailBps) {
+      } else if (entry.peakBps >= cfg.trailingArmBps && pnlBps <= entry.peakBps - cfg.trailingDropBps) {
         sell = pos.token_amount;
       }
       if (sell !== null && sell > 0n) {
         if (sell > pos.token_amount) sell = pos.token_amount;
-        orders.push({ side: 'sell', mint, token_amount: sell, max_slippage_bps: p.sellSlipBps });
+        orders.push({ side: 'sell', mint, token_amount: sell, max_slippage_bps: cfg.sellSlippageBps });
         selling.add(mint);
       }
     }
 
-    // Forget positions that are gone (sold, flattened, completed).
-    for (const mint of [...held.keys()]) {
-      if (!state.positions.has(mint)) held.delete(mint);
+    // Forget books whose position is gone (sold, flattened, completed).
+    for (const mint of [...book.keys()]) {
+      if (!state.positions.has(mint)) book.delete(mint);
     }
     return orders;
   }

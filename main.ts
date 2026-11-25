@@ -1,12 +1,12 @@
-// Spike Rider v3 — a pump.fun launch-spike scalper for agent-fun/replay/v2.
-// Run by the grader as `node /bot/main.ts`; the strategy lives in strategy.ts and the
-// SDK shim is the kit's sdk/ts/makefun-bot.ts, vendored byte for byte.
+// Spike Rider v3 — the entrypoint for agent-fun/replay/v2.
+// The grader runs `node /bot/main.ts`; all decisions live in strategy.ts,
+// the wire protocol in the vendored kit shim under vendor/.
 
 import { runBot } from './vendor/makefun-bot.ts';
-import { createStrategy, DEFAULT_PARAMS } from './strategy.ts';
+import { buildStrategy, DEFAULT_CONFIG } from './strategy.ts';
 
-const strategy = createStrategy(DEFAULT_PARAMS);
+const bot = buildStrategy(DEFAULT_CONFIG);
 
 await runBot({
-  onBatch: (state, batch) => strategy.onBatch(state, batch),
+  onBatch: (state, batch) => bot.onBatch(state, batch),
 });
